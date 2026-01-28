@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include "esp_sleep.h"
+#include "driver/temp_sensor.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
@@ -42,9 +43,12 @@ const int udpPort = 1010;                 // Server port
 #define SAMPLE_COUNT 30
 #define DEEP_SLEEP_DURATION_MS 10000
 
+// Each sample holds the extern/DS18B20 temp and the internal ESP32-C3 temp
+struct TemperatureSample { float internal; float external; };
+
 // RTC memory to persist data across deep sleep
 RTC_DATA_ATTR int bootCount = 0;
-RTC_DATA_ATTR float temperatureSamples[SAMPLE_COUNT];
+RTC_DATA_ATTR TemperatureSample temperatureSamples[SAMPLE_COUNT];
 RTC_DATA_ATTR uint32_t savedIPAddr = 0;      // Store as uint32_t
 RTC_DATA_ATTR uint32_t savedGatewayAddr = 0;
 RTC_DATA_ATTR uint32_t savedSubnetAddr = 0;
@@ -53,11 +57,11 @@ RTC_DATA_ATTR bool hasValidIP = false;
 
 WiFiUDP udp;
 
-// Buffer for UDP packet (100 floats = 400 bytes + 4 byte header)
-#define UDP_BUFFER_SIZE (sizeof(uint32_t) + sizeof(float) * SAMPLE_COUNT)
+// Buffer for UDP packet (2 floats per sample + 4 byte header)
+#define UDP_BUFFER_SIZE (sizeof(uint32_t) + sizeof(TemperatureSample) * SAMPLE_COUNT)
 uint8_t udpBuffer[UDP_BUFFER_SIZE];
 
-float readTemperature() {
+void readTemperatures() {
   // Power on the DS18B20
   pinMode(SENSOR_GND_PIN, OUTPUT);
   digitalWrite(SENSOR_GND_PIN, LOW);
@@ -80,11 +84,22 @@ float readTemperature() {
   sensor.setWaitForConversion(false);
   sensor.requestTemperatures();
   
-  DEBUG_PRINTLN("Temperature conversion started");
-  
-  // DS18B20 needs ~750ms for 12-bit conversion
+  DEBUG_PRINTLN("Temperature conversion started on DS18B20");
+
+  // while we wait for the DS18B20, grab the internal temperature from the ESP32-C3
+  temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
+  temp_sensor.dac_offset = TSENS_DAC_L2; // Default range (-10°C to 80°C)
+  temp_sensor_set_config(temp_sensor);
+
+  temp_sensor_start();
+  delay(10); // Let the Sigma-Delta ADC stabilize
+  float internal_temp = 0;
+  temp_sensor_read_celsius(&internal_temp);  
+  temp_sensor_stop();
+
+  // DS18B20 needs ~650ms for 12-bit conversion
   // Use light sleep in a loop to save power while waiting
-  const unsigned long sleepDurations[] = {600 * 1000, 100 * 1000, 50 * 1000, 50 * 1000, 50 * 1000, 50 * 1000 };
+  const unsigned long sleepDurations[] = {580 * 1000, 80 * 1000, 50 * 1000, 50 * 1000, 50 * 1000, 50 * 1000 };
   unsigned long conversionStart = millis();
   int sleepIndex = 0;
   
@@ -110,10 +125,20 @@ float readTemperature() {
   // Return error value if reading failed
   if (temp == DEVICE_DISCONNECTED_C) {
     DEBUG_PRINTLN("ERROR: Sensor disconnected!");
-    return -127.0;
+    temperatureSamples[bootCount % SAMPLE_COUNT].external = -127.0;
+    temperatureSamples[bootCount % SAMPLE_COUNT].internal = -127.0;
   }
-  
-  return temp;
+
+  DEBUG_PRINT("DS18B20 Temperature: ");
+  DEBUG_PRINT(temp);
+  DEBUG_PRINTLN("°C");
+
+  DEBUG_PRINT("Internal Temperature: ");
+  DEBUG_PRINT(internal_temp);
+  DEBUG_PRINTLN("°C");
+
+  temperatureSamples[bootCount % SAMPLE_COUNT].external = temp;
+  temperatureSamples[bootCount % SAMPLE_COUNT].internal = internal_temp;
 }
 
 void prepareUDPBuffer() {
@@ -123,7 +148,12 @@ void prepareUDPBuffer() {
   memcpy(udpBuffer + offset, &sampleCount, sizeof(uint32_t));
   offset += sizeof(uint32_t);
   
-  memcpy(udpBuffer + offset, temperatureSamples, SAMPLE_COUNT * sizeof(float));
+  for (int i = 0; i < SAMPLE_COUNT; ++i) {
+    memcpy(udpBuffer + offset, &(temperatureSamples[i].external), sizeof(float));
+    offset += sizeof(float);
+    memcpy(udpBuffer + offset, &(temperatureSamples[i].internal), sizeof(float));
+    offset += sizeof(float);
+  }
   
   DEBUG_PRINTLN("UDP buffer prepared");
 }
@@ -134,18 +164,13 @@ void setup() {
   
 RESTART:
 
-  // Read and store temperature sample
-  float currentTemp = readTemperature();
-  temperatureSamples[bootCount] = currentTemp;
-  
+  // Read and store temperature samples before incrementing bootCount
+  readTemperatures();
+    
   bootCount++;
   DEBUG_PRINT("Boot number: ");
   DEBUG_PRINTLN(bootCount);
-
-  DEBUG_PRINT("Temperature: ");
-  DEBUG_PRINT(currentTemp);
-  DEBUG_PRINTLN("°C");
-  
+ 
   if (bootCount >= SAMPLE_COUNT) {
     DEBUG_PRINTLN("Counter reached SAMPLE_COUNT");
     
