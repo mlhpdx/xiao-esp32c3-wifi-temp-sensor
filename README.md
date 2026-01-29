@@ -1,20 +1,21 @@
 # Power Efficient XIAO ESP32-C3 WiFi Temperature Sensor
 
-Low-power temperature logging system that batches readings and sends them over UDP. Built for XIAO ESP32-C3 with deep sleep between samples and light sleep during temperature sensor stabilization.
+Low-power temperature logging system that batches readings and sends them over UDP. Built for XIAO ESP32-C3 with deep sleep between samples and light sleep during temperature sensor conversion.
 
 ## How it works
 
-Wakes up every 10 seconds, reads temperature, stores it in RTC memory, then goes back to deep sleep. After 30 samples (roughly 5 minutes), it connects to WiFi and dumps the batch via UDP to a remote server. Then resets the counter and repeats.
+Wakes up every 10 seconds, reads both DS18B20 external temperature and ESP32-C3 internal temperature, stores them in RTC memory, then goes back to deep sleep. After 30 samples (roughly 5 minutes), it connects to WiFi and sends the batch via UDP to a remote server. Then resets the counter and repeats.
 
 The WiFi connection uses static IP caching in RTC memory to speed up reconnects - first connection uses DHCP and saves the config, subsequent connections use the saved IP. If connection fails, it falls back to DHCP.
 
 ## Key features
 
-- **Ultra-low power**: Active for ~627ms every 10 seconds (WiFi off), most of that in light sleep
-- **Long Battery Life**: Continuous operation for a year on a 1000mAh battery (~115µA average)
-- **Batched transmission**: 30 samples sent as single binary UDP packet
+- **Ultra-low power**: Active for ~670ms every 10 seconds (WiFi off, most of that time in light sleep)
+- **Long Battery Life**: Continuous operation for over a year on a 1000mAh battery
+- **Dual temperature**: Captures both external (DS18B20) and internal (ESP32-C3) temperatures
+- **Batched transmission**: 30 sample pairs sent as single binary UDP packet
 - **Fast WiFi**: Static IP caching cuts connection time to ~63ms vs ~2s (first connection)
-- **Sensor power management**: DS18B20 powered only during measurement, GPIO pins floated when off
+- **Sensor power management**: DS18B20 powered only during measurement with GPIO hold during sleep
 - **Debug mode**: Flip `DEBUG_MODE` to 1 for serial debug output, 0 for production (max battery life)
 
 ## Configuration
@@ -40,10 +41,15 @@ Adjust timing and batch size for battery life:
 ## UDP packet format
 
 Binary packet structure:
-- Bytes 0-3: uint32_t sample count
-- Bytes 4-: floats (temperature values in °C)
+- Bytes 0-7: DS18B20 sensor address (8 bytes, unique device ID)
+- Bytes 8-11: uint32_t sample count (30)
+- Bytes 12+: Alternating float pairs - external temp, internal temp (°C)
 
-Total packet size: 124 bytes with 30 samples (4 + 30×4)
+Each sample contains:
+- 4 bytes: DS18B20 external temperature (float)
+- 4 bytes: ESP32-C3 internal temperature (float)
+
+Total packet size: 252 bytes with 30 samples (8 + 4 + 30×8)
 
 ## Hardware wiring
 
@@ -58,14 +64,11 @@ The sensor is completely powered down between readings to minimize battery drain
 
 ## Temperature reading strategy
 
-Uses async conversion with variable-interval light sleep to minimize power during the ~627ms DS18B20 conversion time. The sensor is powered on, stabilized with a 20ms light sleep, then conversion starts.
+The DS18B20 is powered up and conversion is initiated asynchronously. During the ~650ms conversion time, the ESP32-C3 reads its internal temperature sensor, then enters light sleep for 650ms to save power.
 
-The MCU sleeps in progressively shorter intervals to optimize for both power and responsiveness:
-- First check at 600ms (typical conversion completion - measured at 627ms)
-- Second check at +100ms (700ms total)
-- Subsequent four checks every 50ms
+Critical for reliable operation: GPIO hold is enabled on the power pins (GPIO3 and GPIO5) before light sleep. This maintains the HIGH/LOW states during sleep, keeping the DS18B20 powered throughout the conversion. Without GPIO hold, the pins would lose state during light sleep, causing the sensor to power off and return invalid readings (typically 85°C).
 
-This adaptive polling uses fewer wakeup cycles than uniform intervals, saving battery while catching conversion completion quickly. Sensor power (GPIO5) is driven LOW and all three GPIO pins are floated immediately after reading to eliminate current leakage.
+After conversion completes, GPIO hold is released and all three pins are set to INPUT (high-impedance) to eliminate current leakage when the sensor is off.
 
 ## Notes
 

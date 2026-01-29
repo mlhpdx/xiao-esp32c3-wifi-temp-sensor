@@ -48,26 +48,33 @@ struct TemperatureSample { float internal; float external; };
 
 // RTC memory to persist data across deep sleep
 RTC_DATA_ATTR int bootCount = 0;
-RTC_DATA_ATTR TemperatureSample temperatureSamples[SAMPLE_COUNT];
-RTC_DATA_ATTR uint32_t savedIPAddr = 0;      // Store as uint32_t
+RTC_DATA_ATTR uint32_t savedIPAddr = 0; // IPv4
 RTC_DATA_ATTR uint32_t savedGatewayAddr = 0;
 RTC_DATA_ATTR uint32_t savedSubnetAddr = 0;
 RTC_DATA_ATTR uint32_t savedDNSAddr = 0;
+RTC_DATA_ATTR volatile TemperatureSample temperatureSamples[SAMPLE_COUNT];
+RTC_DATA_ATTR bool hasSensorAddress = false;
+RTC_DATA_ATTR volatile uint8_t sensorAddress[8] = {0};
 RTC_DATA_ATTR bool hasValidIP = false;
 
-WiFiUDP udp;
 
-// Buffer for UDP packet (2 floats per sample + 4 byte header)
-#define UDP_BUFFER_SIZE (sizeof(uint32_t) + sizeof(TemperatureSample) * SAMPLE_COUNT)
+// Buffer for UDP packet (8 byte sensor ID + 4 byte count + samples)
+#define UDP_BUFFER_SIZE (8 + sizeof(uint32_t) + sizeof(TemperatureSample) * SAMPLE_COUNT)
 uint8_t udpBuffer[UDP_BUFFER_SIZE];
 
 void readTemperatures() {
+  unsigned long samplingStart = millis();
+
   // Power on the DS18B20
   pinMode(SENSOR_GND_PIN, OUTPUT);
   digitalWrite(SENSOR_GND_PIN, LOW);
 
   pinMode(SENSOR_POWER_PIN, OUTPUT);
   digitalWrite(SENSOR_POWER_PIN, HIGH);
+
+  // Hold GPIO states during light sleep to keep sensor powered
+  gpio_hold_en((gpio_num_t)SENSOR_GND_PIN);
+  gpio_hold_en((gpio_num_t)SENSOR_POWER_PIN);
 
   // Light sleep for sensor power stabilization
   LIGHT_SLEEP(20 * 1000);
@@ -80,6 +87,20 @@ void readTemperatures() {
   
   sensor.begin();
   
+  // Get sensor address on first boot
+  if (!hasSensorAddress) {
+    sensor.getAddress((uint8_t*)sensorAddress, 0);
+    hasSensorAddress = true;
+    #if DEBUG_MODE
+    Serial.print("Sensor address retrieved: ");
+    for (int i = 0; i < 8; ++i) {
+      if (sensorAddress[i] < 0x10) Serial.print('0');
+      Serial.print(sensorAddress[i], HEX);
+    }
+    Serial.println("");
+    #endif
+  }
+  
   // Start async temperature conversion
   sensor.setWaitForConversion(false);
   sensor.requestTemperatures();
@@ -90,45 +111,32 @@ void readTemperatures() {
   temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
   temp_sensor.dac_offset = TSENS_DAC_L2; // Default range (-10°C to 80°C)
   temp_sensor_set_config(temp_sensor);
-
   temp_sensor_start();
   delay(10); // Let the Sigma-Delta ADC stabilize
+
   float internal_temp = 0;
   temp_sensor_read_celsius(&internal_temp);  
+  temperatureSamples[bootCount % SAMPLE_COUNT].internal = internal_temp;
   temp_sensor_stop();
 
   // DS18B20 needs ~650ms for 12-bit conversion
-  // Use light sleep in a loop to save power while waiting
-  const unsigned long sleepDurations[] = {580 * 1000, 80 * 1000, 50 * 1000, 50 * 1000, 50 * 1000, 50 * 1000 };
-  unsigned long conversionStart = millis();
-  int sleepIndex = 0;
-  
-  while (!sensor.isConversionComplete() && sleepIndex < sizeof(sleepDurations)/sizeof(sleepDurations[0])) {
-    DEBUG_PRINT("Entering light sleep... ");
-    DEBUG_PRINTLN(sleepDurations[sleepIndex] / 1000);
-    LIGHT_SLEEP(sleepDurations[sleepIndex]);
-    sleepIndex++;
-  }
+  LIGHT_SLEEP(650 * 1000);
   
   float temp = sensor.getTempCByIndex(0);
 
   DEBUG_PRINT("Conversion time: ");
-  DEBUG_PRINT(millis() - conversionStart);
+  DEBUG_PRINT(millis() - samplingStart);
   DEBUG_PRINTLN("ms");
   
-  // Power off the sensor
+  // Release GPIO holds and power off the sensor
+  gpio_hold_dis((gpio_num_t)SENSOR_GND_PIN);
+  gpio_hold_dis((gpio_num_t)SENSOR_POWER_PIN);
+  
   digitalWrite(SENSOR_POWER_PIN, LOW);
   pinMode(SENSOR_POWER_PIN, INPUT);  // Float the pin to prevent current leak
   pinMode(SENSOR_DATA_PIN, INPUT);  // Disable internal pullup to prevent current leak
   pinMode(SENSOR_GND_PIN, INPUT);  // Float the pin to prevent current leak
   
-  // Return error value if reading failed
-  if (temp == DEVICE_DISCONNECTED_C) {
-    DEBUG_PRINTLN("ERROR: Sensor disconnected!");
-    temperatureSamples[bootCount % SAMPLE_COUNT].external = -127.0;
-    temperatureSamples[bootCount % SAMPLE_COUNT].internal = -127.0;
-  }
-
   DEBUG_PRINT("DS18B20 Temperature: ");
   DEBUG_PRINT(temp);
   DEBUG_PRINTLN("°C");
@@ -138,20 +146,25 @@ void readTemperatures() {
   DEBUG_PRINTLN("°C");
 
   temperatureSamples[bootCount % SAMPLE_COUNT].external = temp;
-  temperatureSamples[bootCount % SAMPLE_COUNT].internal = internal_temp;
 }
 
 void prepareUDPBuffer() {
-  uint32_t sampleCount = SAMPLE_COUNT;
   size_t offset = 0;
   
+  // Write sensor address (8 bytes)
+  memcpy(udpBuffer + offset, (const void*)sensorAddress, 8);
+  offset += 8;
+  
+  // Write sample count (4 bytes)
+  uint32_t sampleCount = SAMPLE_COUNT;
   memcpy(udpBuffer + offset, &sampleCount, sizeof(uint32_t));
   offset += sizeof(uint32_t);
   
+  // Write temperature samples
   for (int i = 0; i < SAMPLE_COUNT; ++i) {
-    memcpy(udpBuffer + offset, &(temperatureSamples[i].external), sizeof(float));
+    memcpy(udpBuffer + offset, (const void*)&(temperatureSamples[i].external), sizeof(float));
     offset += sizeof(float);
-    memcpy(udpBuffer + offset, &(temperatureSamples[i].internal), sizeof(float));
+    memcpy(udpBuffer + offset, (const void*)&(temperatureSamples[i].internal), sizeof(float));
     offset += sizeof(float);
   }
   
@@ -232,6 +245,7 @@ RESTART:
       
       DEBUG_PRINTLN("IP configuration saved to RTC memory");
 
+      WiFiUDP udp;
       udp.begin(udpPort);
       udp.beginPacket(udpAddress, udpPort);
       udp.write(udpBuffer, UDP_BUFFER_SIZE);
@@ -239,6 +253,8 @@ RESTART:
 
       delay(50);
       
+      udp.stop();
+
       DEBUG_PRINT("Binary UDP packet sent (");
       DEBUG_PRINT(UDP_BUFFER_SIZE);
       DEBUG_PRINTLN(" bytes)");
