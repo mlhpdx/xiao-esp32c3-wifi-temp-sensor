@@ -11,7 +11,7 @@ The WiFi connection uses static IP caching in RTC memory to speed up reconnects 
 ## Key features
 
 - **Ultra-low power**: Active for ~670ms every 10 seconds (WiFi off, most of that time in light sleep)
-- **Long Battery Life**: Continuous operation for over a year on a 1000mAh battery
+- **Long Battery Life**: Continuous operation for over a year on a 2500mAh 18650 battery
 - **Dual temperature**: Captures both external (DS18B20) and internal (ESP32-C3) temperatures
 - **Batched transmission**: 30 sample pairs sent as single binary UDP packet
 - **Fast WiFi**: Static IP caching cuts connection time to ~63ms vs ~2s (first connection)
@@ -69,6 +69,16 @@ The DS18B20 is powered up and conversion is initiated asynchronously. During the
 Critical for reliable operation: GPIO hold is enabled on the power pins (GPIO3 and GPIO5) before light sleep. This maintains the HIGH/LOW states during sleep, keeping the DS18B20 powered throughout the conversion. Without GPIO hold, the pins would lose state during light sleep, causing the sensor to power off and return invalid readings (typically 85°C).
 
 After conversion completes, GPIO hold is released and all three pins are set to INPUT (high-impedance) to eliminate current leakage when the sensor is off.
+
+## Power consumption
+
+With the optimized design using deep sleep (43µA), light sleep during sensor conversion (800µA), and minimal WiFi-on time (~64ms every 5 minutes), the average power consumption is approximately 139 mAh/month.
+
+**Battery life estimates:**
+- 1000 mAh battery: ~7 months
+- 3000 mAh battery (18650): ~1.8 years
+
+Power distribution breakdown shows that despite spending 93.6% of time in deep sleep, active CPU operations account for 43.7% of total power consumption, highlighting the importance of minimizing wake time.
 
 ## Notes
 
